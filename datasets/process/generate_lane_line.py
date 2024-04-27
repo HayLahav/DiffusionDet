@@ -49,6 +49,26 @@ class GenerateLaneLine(object):
             img_transforms = []
         self.transform = iaa.Sequential(img_transforms)
 
+    from shapely.geometry import LineString, Polygon
+
+    #This function takes a list of lanes, where each lane is represented as a list of points,and converts them into bounding box polygons with a specified width (box_width). It computes perpendicular vectors to the lane line, creates points for the bounding box, and constructs a Polygon object representing the bounding box. Finally, it returns a list of Polygon objects representing the bounding boxes around the lanes.
+    
+    def lane_to_bounding_boxes(lanes, box_width=5):
+         bounding_boxes = []
+         for lane in lanes:
+         line = LineString(lane)
+         # Compute perpendicular vectors to the line
+         line_midpoint = line.interpolate(0.5, normalized=True)
+         angle = np.arctan2(line.coords[1][1] - line.coords[0][1], line.coords[1][0] - line.coords[0][0])
+         dx = np.sin(angle) * (box_width / 2)
+         dy = np.cos(angle) * (box_width / 2)
+         # Create bounding box polygon
+         bounding_box_points = [(point.x + dx, point.y + dy) for point in line.coords]
+         bounding_box_points += [(point.x - dx, point.y - dy) for point in reversed(line.coords)]
+         bounding_boxes.append(Polygon(bounding_box_points))
+    return bounding_boxes
+
+    
     def lane_to_linestrings(self, lanes):
         lines = []
         for lane in lanes:
