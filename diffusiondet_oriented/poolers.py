@@ -255,7 +255,7 @@ class ROIPooler(nn.Module):
         assert canonical_box_size > 0
         self.canonical_box_size = canonical_box_size
 
-    def forward(self, x: List[torch.Tensor], box_lists: List[torch.Tensor]):
+    def forward(self, x: List[torch.Tensor],  box_lists: List[RotatedBoxes]):
         """
         Args:
             x (list[Tensor]): A list of feature maps of NCHW shape, with scales matching those
