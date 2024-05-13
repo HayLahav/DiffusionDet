@@ -72,7 +72,7 @@ def rotated_boxes_to_corners(rotated_boxes):
     return corners
 
 def assign_boxes_to_levels(
-    box_lists: Union[List[Boxes], List[RotatedBoxes]],
+    box_lists: List[RotatedBoxes]],
     min_level: int,
     max_level: int,
     canonical_box_size: int,
@@ -101,13 +101,12 @@ def assign_boxes_to_levels(
     """
     if isinstance(box_lists[0], Boxes):
         box_sizes = torch.sqrt(cat([boxes.area() for boxes in box_lists]))
-      #  raise ValueError("Boxes type: {}".format(type(box_lists[0])))
+        raise ValueError("Boxes type: {}".format(type(box_lists[0])))
     elif isinstance(box_lists[0], RotatedBoxes):
         box_sizes = torch.sqrt(cat([boxes.area() for boxes in box_lists]))
     else:
         raise ValueError("Unsupported box type: {}".format(type(box_lists[0])))
         
-    box_sizes = torch.sqrt(cat([boxes.area() for boxes in box_lists]))
     # Eqn.(1) in FPN paper
     level_assignments = torch.floor(
         canonical_level + torch.log2(box_sizes / canonical_box_size + 1e-8)
