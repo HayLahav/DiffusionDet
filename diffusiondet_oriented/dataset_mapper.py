@@ -12,10 +12,17 @@ import torch
 
 from detectron2.data import detection_utils as utils
 from detectron2.data import transforms as T
-
+from detectron2.structures import BoxMode
 
 __all__ = ["DiffusionDetDatasetMapper"]
 
+def rotate_bbox(annotation, transforms):
+    if len(annotation["bbox"]) == 4:
+        # Add a default angle of 0 if the bbox has only 4 elements
+        annotation["bbox"] = list(annotation["bbox"]) + [0]
+    annotation["bbox"] = transforms.apply_rotated_box(np.asarray([annotation['bbox']]))[0]
+    annotation["bbox_mode"] = BoxMode.XYXY_ABS
+    return annotation
 
 def build_transform_gen(cfg, is_train):
     """
@@ -60,13 +67,13 @@ class DiffusionDetDatasetMapper:
     """
 
     def __init__(self, cfg, is_train=True):
-        if cfg.INPUT.CROP.ENABLED and is_train:
-            self.crop_gen = [
-                T.ResizeShortestEdge([400, 500, 600], sample_style="choice"),
-                T.RandomCrop(cfg.INPUT.CROP.TYPE, cfg.INPUT.CROP.SIZE),
-            ]
-        else:
-            self.crop_gen = None
+  #      if cfg.INPUT.CROP.ENABLED and is_train:
+   #         self.crop_gen = [
+    #            T.ResizeShortestEdge([400, 500, 600], sample_style="choice"),
+     #           T.RandomCrop(cfg.INPUT.CROP.TYPE, cfg.INPUT.CROP.SIZE),
+   #         ]
+        #else:
+        self.crop_gen = None
 
         self.tfm_gens = build_transform_gen(cfg, is_train)
         logging.getLogger(__name__).info(
@@ -118,10 +125,10 @@ class DiffusionDetDatasetMapper:
 
             # USER: Implement additional transformations if you have other types of data
             annos = [
-                utils.transform_instance_annotations(obj, transforms, image_shape)
+                rotate_bbox(obj, transforms)
                 for obj in dataset_dict.pop("annotations")
                 if obj.get("iscrowd", 0) == 0
             ]
-            instances = utils.annotations_to_instances(annos, image_shape)
+            instances = utils.annotations_to_instances_rotated(annos, image_shape)
             dataset_dict["instances"] = utils.filter_empty_instances(instances)
         return dataset_dict

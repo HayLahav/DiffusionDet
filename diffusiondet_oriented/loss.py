@@ -10,13 +10,52 @@ DiffusionDet model and criterion classes.
 """
 import torch
 import torch.nn.functional as F
+import math
 from torch import nn
 from fvcore.nn import sigmoid_focal_loss_jit
 import torchvision.ops as ops
 from .util import box_ops
 from .util.misc import get_world_size, is_dist_avail_and_initialized
 from .util.box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
-from oriented_iou_loss import cal_iou, cal_giou
+from iou_op import generalized_box_iou, generalized_polygon_iou, polygon_iou
+from structures_rotated_boxes import pairwise_giou_rotated, pairwise_iou, pairwise_diou_rotated, diou_loss_rotated
+
+
+
+def corners_to_center_height_width_angle(corners):
+    """
+    Convert corners representation to center, height, width, and angle format.
+
+    Arguments:
+        corners (Tensor[N, 8] or List[N, 8]): Tensor or list containing the corner coordinates
+            in the order (x0, y0, x1, y1, x2, y2, x3, y3) for each box.
+
+    Returns:
+        boxes (Tensor[N, 5]): Tensor containing the boxes in the format
+            (x_center, y_center, width, height, angle) for each box.
+    """
+    # Convert corners to tensor if it's not already a tensor
+    if not isinstance(corners, torch.Tensor):
+        corners = torch.tensor(corners)
+
+    # Calculate the center coordinates
+    x_center = (corners[:, 0] + corners[:, 2] + corners[:, 4] + corners[:, 6]) / 4
+    y_center = (corners[:, 1] + corners[:, 3] + corners[:, 5] + corners[:, 7]) / 4
+
+    # Calculate the width and height
+    width = torch.sqrt((corners[:, 0] - corners[:, 2]) ** 2 + (corners[:, 1] - corners[:, 3]) ** 2)
+    height = torch.sqrt((corners[:, 2] - corners[:, 4]) ** 2 + (corners[:, 3] - corners[:, 5]) ** 2)
+
+    # Calculate the angle (in radians)
+    angle_rad = torch.atan2(corners[:, 3] - corners[:, 1], corners[:, 2] - corners[:, 0])
+
+    # Convert the angle from radians to degrees
+    angle_deg = angle_rad * 180 / math.pi
+
+    # Stack the center coordinates, width, height, and angle into a tensor
+    boxes = torch.stack([x_center, y_center, width, height, angle_deg], dim=1)
+
+    return boxes
 
 class SetCriterionDynamicK(nn.Module):
     """ This class computes the loss for DiffusionDet.
@@ -219,7 +258,7 @@ class SetCriterionDynamicK(nn.Module):
             losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
             # Compute GIoU loss between oriented bounding boxes
-            loss_giou = cal_giou(src_boxes, target_boxes, enclosing_type='smallest')
+            loss_giou = diou_loss_rotated(corners_to_center_height_width_angle(src_boxes), corners_to_center_height_width_angle(target_boxes))
             losses['loss_giou'] = loss_giou.sum() / num_boxes
 
         else:
@@ -343,15 +382,20 @@ class HungarianMatcherDynamicK(nn.Module):
                     indices.append(indices_batchi)
                     matched_ids.append(matched_qidx)
                     continue
-
                 bz_gtboxs = targets[batch_idx]['boxes']  # [num_gt, 8] (x0, y0, x1, y1, x2, y2, x3, y3)
+               
                 fg_mask, is_in_boxes_and_center = self.get_in_boxes_info(
                     bz_boxes,  # (x0, y0, x1, y1, x2, y2, x3, y3)
                     bz_gtboxs,  # (x0, y0, x1, y1, x2, y2, x3, y3)
                     expanded_strides=32
                 )
+                
+                
+                
 
-                pair_wise_ious = cal_giou(bz_boxes, bz_gtboxs,enclosing_type= "smallest") 
+               
+
+                pair_wise_ious = pairwise_iou(corners_to_center_height_width_angle(bz_boxes), corners_to_center_height_width_angle(bz_gtboxs)) 
 
                 # Compute the classification cost.
                 if self.use_focal:
@@ -370,10 +414,14 @@ class HungarianMatcherDynamicK(nn.Module):
 
                 # Compute the corner distance cost between boxes
                 cost_bbox = torch.cdist(bz_boxes, bz_gtboxs, p=1)
-
+                cost_giou = -pairwise_diou_rotated(corners_to_center_height_width_angle(bz_boxes), corners_to_center_height_width_angle(bz_gtboxs))
                 # Final cost matrix
-                cost = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * (
-                    -pair_wise_ious) + 100.0 * (~is_in_boxes_and_center)
+                # Check dimensions and raise ValueError if there is a mismatch
+                #if cost_bbox.shape != cost_class.shape or cost_bbox.shape != cost_giou.shape or cost_class.shape != cost_giou.shape:
+              #  raise ValueError(f"Dimension mismatch: cost_bbox.shape={cost_bbox.shape}, "
+               #                  f"cost_class.shape={cost_class.shape}, cost_giou.shape={cost_giou.shape}, is_in_boxes_and_center={is_in_boxes_and_center.shape}")
+                cost = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * (-cost_giou) 
+                #+ 100.0 * (~is_in_boxes_and_center)
                 cost[~fg_mask] = cost[~fg_mask] + 10000.0
 
                 indices_batchi, matched_qidx = self.dynamic_k_matching(cost, pair_wise_ious, bz_gtboxs.shape[0])
@@ -383,56 +431,55 @@ class HungarianMatcherDynamicK(nn.Module):
 
         return indices, matched_ids
 
-    def get_in_boxes_info(boxes, target_gts, expanded_strides):
+    def get_in_boxes_info(self, boxes, target_gts, expanded_strides):
         """
         Determines if points (represented by the centers of the boxes) are inside or outside the ground truth oriented bounding boxes.
-
+        
         Args:
             boxes (torch.Tensor): Tensor of shape (num_boxes, 8) representing predicted oriented bounding boxes with coordinates (x0, y0, x1, y1, x2, y2, x3, y3).
-            target_gts (torch.Tensor): Tensor of shape (num_gts, 8) representing ground truth oriented bounding boxes with coordinates (x0, y0, x1, y1, x2, y2, x3, y3).
+            target_gts (torch.Tensor): Tensor of shape (num_gts, 8) representing ground truth oriented bounding boxes with coordinates (x0, y0, x1, y1, x2, y2, x3, y3)
             expanded_strides (int): Stride value used for the center radius calculation.
-
+            
         Returns:
             Tuple containing:
-                is_in_boxes_anchor (torch.Tensor): Tensor of shape (num_boxes,) indicating whether the center of each box is inside any ground truth box.
-                is_in_boxes_and_center (torch.Tensor): Tensor of shape (num_boxes,) indicating whether the center of each box is inside any ground truth box and within a certain radius from the ground truth box center.
+            is_in_boxes_anchor (torch.Tensor): Tensor of shape (num_boxes,) indicating whether the center of each box is inside any ground truth box.
+            is_in_boxes_and_center (torch.Tensor): Tensor of shape (num_boxes, num_gts) indicating whether the center of each box is inside each ground truth box and within a certain radius from the ground truth box center.
         """
+        
         num_boxes = boxes.size(0)
         num_gts = target_gts.size(0)
-
+        
         # Calculate the centers of the boxes and target ground truth boxes
         box_centers = boxes.view(-1, 4, 2).mean(dim=1)  # (num_boxes, 2)
         gt_centers = target_gts.view(-1, 4, 2).mean(dim=1)  # (num_gts, 2)
-
+        
         # Repeat the box centers and ground truth centers for efficient computation
         expanded_box_centers = box_centers.unsqueeze(1).repeat(1, num_gts, 1)  # (num_boxes, num_gts, 2)
         expanded_gt_centers = gt_centers.unsqueeze(0).repeat(num_boxes, 1, 1)  # (num_boxes, num_gts, 2)
-
+        
         # Compute the distances between box centers and ground truth centers
-        center_distances = torch.sqrt(
-            ((expanded_box_centers - expanded_gt_centers) ** 2).sum(-1))  # (num_boxes, num_gts)
-
+        center_distances = torch.sqrt(((expanded_box_centers - expanded_gt_centers) ** 2).sum(-1))  # (num_boxes, num_gts)
+        
         # Compute the polygon areas of the ground truth boxes
         target_gts_poly = target_gts.view(-1, 4, 2)  # (num_gts, 4, 2)
-        gt_areas = torch.abs(torch.cross(target_gts_poly[:, 1, :] - target_gts_poly[:, 0, :],
-                                         target_gts_poly[:, 2, :] - target_gts_poly[:, 0, :], dim=1)).sum(
-            -1) / 2  # (num_gts,)
-
+        v1 = torch.cat([target_gts_poly[:, 1, :] - target_gts_poly[:, 0, :], torch.zeros_like(target_gts_poly[:, 0, :1])], dim=-1)  # (num_gts, 3)
+        v2 = torch.cat([target_gts_poly[:, 2, :] - target_gts_poly[:, 0, :], torch.zeros_like(target_gts_poly[:, 0, :1])], dim=-1)  # (num_gts, 3)
+        gt_areas = torch.abs(torch.cross(v1, v2, dim=-1)).sum(-1) / 2  # (num_gts,)
+        
         # Compute the maximum diagonal length of the ground truth boxes
-        max_diag_lengths = torch.sqrt(
-            ((target_gts_poly.max(dim=1)[0] - target_gts_poly.min(dim=1)[0]) ** 2).sum(-1))  # (num_gts,)
-
+        max_diag_lengths = torch.sqrt(((target_gts_poly.max(dim=1)[0] - target_gts_poly.min(dim=1)[0]) ** 2).sum(-1))  # (num_gts,)
+        
         # Compute the center radius for each ground truth box
         center_radii = max_diag_lengths / expanded_strides  # (num_gts,)
-
+        
         # Determine if the box centers are inside the ground truth boxes
-        is_in_boxes = (center_distances <= gt_areas.unsqueeze(0) / center_radii.unsqueeze(1)).any(dim=1)  # (num_boxes,)
-
+        is_in_boxes = (center_distances <= gt_areas.view(1, -1) / center_radii.view(1, -1))  # (num_boxes, num_gts)
+        
         # Determine if the box centers are inside the ground truth boxes and within the center radius
-        is_in_centers = (center_distances <= center_radii.unsqueeze(0)).any(dim=1)  # (num_boxes,)
-        is_in_boxes_and_center = is_in_boxes & is_in_centers
-
-        return is_in_boxes, is_in_boxes_and_center
+        is_in_centers = (center_distances <= center_radii.view(1, -1))  # (num_boxes, num_gts)
+        is_in_boxes_and_center = is_in_boxes & is_in_centers  # (num_boxes, num_gts)
+        is_in_boxes_anchor = is_in_boxes.any(dim=1)  # (num_boxes,)
+        return is_in_boxes_anchor, is_in_boxes_and_center
 
     def dynamic_k_matching(self, cost, pair_wise_ious, num_gt):
         matching_matrix = torch.zeros_like(cost)  # [300,num_gt]

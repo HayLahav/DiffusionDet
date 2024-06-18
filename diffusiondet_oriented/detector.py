@@ -14,10 +14,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from detectron2.layers import batched_nms
+from detectron2.layers import batched_nms, nms_rotated,batched_nms_rotated
 from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, detector_postprocess
 
-from detectron2.structures import Boxes, ImageList, Instances
+from detectron2.structures import Boxes, ImageList, Instances, RotatedBoxes
 
 from .loss import SetCriterionDynamicK, HungarianMatcherDynamicK
 from .head import DynamicHead
@@ -171,14 +171,13 @@ class DiffusionDet(nn.Module):
     def model_predictions(self, backbone_feats, images_whwh, x, t, x_self_cond=None, clip_x_start=False):
         x_boxes = torch.clamp(x, min=-1 * self.scale, max=self.scale)
         x_boxes = ((x_boxes / self.scale) + 1) / 2
-        x_boxes = box_cxcywha_to_corners(x_boxes)
-        x_boxes = x_boxes * images_whwh[:, None, :]
+        x_boxes = box_cxcywha_to_corners(x_boxes)  # Convert to corners format
+        x_boxes = x_boxes * torch.cat([images_whwh, images_whwh], dim=-1)[:, None, :]  # Scale to image size
         outputs_class, outputs_coord = self.head(backbone_feats, x_boxes, t, None)
 
-        x_start = outputs_coord[-1]  # (batch, num_proposals, 8) predict boxes: absolute coordinates (x0,y0,x1,y1,x2,y2,x3,y3)
-        x_start = x_start / images_whwh[:, None, :]
-        #x_start = box_xyxy_to_corners(x_start)
-        #x_start = box_corners_to_cxcywha(x_start)
+        x_start = outputs_coord[-1]  # (batch, num_proposals, 8) predict boxes: absolute coordinates (x0, y0, x1, y1, x2, y2, x3, y3)
+        x_start = x_start / torch.cat([images_whwh, images_whwh], dim=-1)[:, None, :]  # Normalize to [0, 1]
+        x_start = box_corners_to_cxcywha(x_start)  # Convert back to (cx, cy, w, h, angle) format
         x_start = (x_start * 2 - 1.) * self.scale
         x_start = torch.clamp(x_start, min=-1 * self.scale, max=self.scale)
         pred_noise = self.predict_noise_from_start(x, t, x_start)
@@ -188,7 +187,7 @@ class DiffusionDet(nn.Module):
     @torch.no_grad()
     def ddim_sample(self, batched_inputs, backbone_feats, images_whwh, images, clip_denoised=True, do_postprocess=True):
         batch = images_whwh.shape[0]
-        shape = (batch, self.num_proposals, 8) # 8 because x0,y0,x1,y1,x2,y2,x3,y3
+        shape = (batch, self.num_proposals, 8)  # Updated shape for corners format
         total_timesteps, sampling_timesteps, eta, objective = self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -205,7 +204,7 @@ class DiffusionDet(nn.Module):
             self_cond = x_start if self.self_condition else None
 
             preds, outputs_class, outputs_coord = self.model_predictions(backbone_feats, images_whwh, img, time_cond,
-                                                                         self_cond, clip_x_start=clip_denoised)
+                                                                     self_cond, clip_x_start=clip_denoised)
             pred_noise, x_start = preds.pred_noise, preds.pred_x_start
 
             if self.box_renewal:  # filter
@@ -237,7 +236,7 @@ class DiffusionDet(nn.Module):
 
             if self.box_renewal:  # filter
                 # replenish with randn boxes
-                img = torch.cat((img, torch.randn(1, self.num_proposals - num_remain, 4, device=img.device)), dim=1)
+                 img = torch.cat((img, torch.randn(1, self.num_proposals - num_remain, 8, device=img.device)), dim=1)
             if self.use_ensemble and self.sampling_timesteps > 1:
                 box_pred_per_image, scores_per_image, labels_per_image = self.inference(outputs_class[-1],
                                                                                         outputs_coord[-1],
@@ -251,13 +250,15 @@ class DiffusionDet(nn.Module):
             scores_per_image = torch.cat(ensemble_score, dim=0)
             labels_per_image = torch.cat(ensemble_label, dim=0)
             if self.use_nms:
-                keep = batched_nms(box_pred_per_image, scores_per_image, labels_per_image, 0.5)
+                # Convert box_pred_per_image from corners format to (x_ctr, y_ctr, width, height, angle_degrees) format
+                boxes_for_nms = box_corners_to_cxcywha(box_pred_per_image)
+                keep = batched_nms_rotated(boxes_for_nms, scores_per_image, labels_per_image, 0.5)
                 box_pred_per_image = box_pred_per_image[keep]
                 scores_per_image = scores_per_image[keep]
                 labels_per_image = labels_per_image[keep]
-
+  
             result = Instances(images.image_sizes[0])
-            result.pred_boxes = Boxes(box_pred_per_image)
+            result.pred_boxes = RotatedBoxes(box_pred_per_image)  # Use RotatedBoxes for corners format
             result.scores = scores_per_image
             result.pred_classes = labels_per_image
             results = [result]
@@ -266,6 +267,7 @@ class DiffusionDet(nn.Module):
             box_cls = output["pred_logits"]
             box_pred = output["pred_boxes"]
             results = self.inference(box_cls, box_pred, images.image_sizes)
+
         if do_postprocess:
             processed_results = []
             for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
@@ -274,6 +276,8 @@ class DiffusionDet(nn.Module):
                 r = detector_postprocess(results_per_image, height, width)
                 processed_results.append({"instances": r})
             return processed_results
+
+   
 
     # forward diffusion
     def q_sample(self, x_start, t, noise=None):
@@ -284,51 +288,68 @@ class DiffusionDet(nn.Module):
         sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
 
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-
+  
     def forward(self, batched_inputs, do_postprocess=True):
         """
         Args:
-           batched_inputs: a list, batched outputs of :class:`DatasetMapper`.
+           batched_inputs: a list, batched outputs of :class:DatasetMapper.
                 Each item in the list contains the inputs for one image.
                 For now, each item in the list is a dict that contains:
                    * image: Tensor, image in (C, H, W) format.
                    * instances: Instances
                 Other information that's included in the original dicts, such as:
                    * "height", "width" (int): the output resolution of the model, used in inference.
-                        See :meth:`postprocess` for details.
-    """
+                        See :meth:postprocess for details.
+        """
         images, images_whwh = self.preprocess_image(batched_inputs)
-
+        # images: (batch_size, C, H, W)
+        # images_whwh: (batch_size, 4)
+    
         if isinstance(images, (list, torch.Tensor)):
             images = nested_tensor_from_tensor_list(images)
-
+    
         # Feature Extraction.
         src = self.backbone(images.tensor)
+        # src: dictionary of feature maps, each with shape (batch_size, C, H, W)
+      
         features = list()
         for f in self.in_features:
             feature = src[f]
             features.append(feature)
-
+        # features: list of feature maps, each with shape (batch_size, C, H, W)
+    
         # Prepare Proposals.
         if not self.training:
             results = self.ddim_sample(batched_inputs, features, images_whwh, images)
             return results
-
+    
         if self.training:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             targets, x_boxes, noises, t = self.prepare_targets(gt_instances)
-            t = t.squeeze(-1)
+            # targets: list of dictionaries, each containing ground truth information for an image
+            # x_boxes: (batch_size, num_proposals, 4) or (batch_size, num_proposals, 8) depending on the box format
+            # noises: (batch_size, num_proposals, 4) or (batch_size, num_proposals, 8) depending on the box format
+            # t: (batch_size, 1)
         
-        # Broadcast images_whwh to match the shape of x_boxes
-            x_boxes = x_boxes * images_whwh[:, None, :2].repeat(1, 1, 4)
+            t = t.squeeze(-1)
+            # t: (batch_size,)
+        
+            # Broadcast images_whwh to match the shape of x_boxes
+            images_whwh = images_whwh.repeat(1, 2)  # Repeat the width and height dimensions
+            # images_whwh: (batch_size, 8)
+        
+            x_boxes = x_boxes * images_whwh[:, None, :].repeat(1, 1, 4)
+           # x_boxes: (batch_size, num_proposals, 8)
         
             outputs_class, outputs_coord = self.head(features, x_boxes, t, None)
+            # outputs_class: list of classification predictions, each with shape (batch_size, num_proposals, num_classes)
+            # outputs_coord: list of box predictions, each with shape (batch_size, num_proposals, 4) or (batch_size, num_proposals, 8)
         
             output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         
             if self.deep_supervision:
                 output['aux_outputs'] = [{'pred_logits': a, 'pred_boxes': b}
-                                            for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+                                         for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
         
             loss_dict = self.criterion(output, targets)
             weight_dict = self.criterion.weight_dict
@@ -338,45 +359,35 @@ class DiffusionDet(nn.Module):
                     loss_dict[k] *= weight_dict[k]
         
             return loss_dict
+  
             
     def prepare_diffusion_repeat(self, gt_boxes):
         """
-        :param gt_boxes: (cx, cy, w, h, angle), normalized
-        :param num_proposals:
+        :param gt_boxes: (x0, y0, x1, y1, x2, y2, x3, y3), normalized
         """
         t = torch.randint(0, self.num_timesteps, (1,), device=self.device).long()
-
-        # Create noise tensor with shape (num_proposals, 5) where the angle parameter is always 0
+       # Create noise tensor with shape (num_proposals, 5) where the angle parameter is always 0
         noise = torch.randn(self.num_proposals, 5, device=self.device)
         noise[:, 4] = 0  # Set the angle noise to 0
-
         num_gt = gt_boxes.shape[0]
         if not num_gt:  # generate fake gt boxes if empty gt boxes
-            gt_boxes = torch.as_tensor([[0.5, 0.5, 1., 1., 0.]], dtype=torch.float, device=self.device)
+            gt_boxes = torch.as_tensor([[0.5, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0, 0.5]], dtype=torch.float, device=self.device)
             num_gt = 1
-
         num_repeat = self.num_proposals // num_gt  # number of repeat except the last gt box in one image
         repeat_tensor = [num_repeat] * (num_gt - self.num_proposals % num_gt) + [num_repeat + 1] * (
                 self.num_proposals % num_gt)
         assert sum(repeat_tensor) == self.num_proposals
         random.shuffle(repeat_tensor)
         repeat_tensor = torch.tensor(repeat_tensor, device=self.device)
-
         gt_boxes_scaled = (gt_boxes * 2. - 1.) * self.scale
         gt_boxes_corners = box_corners_to_cxcywha(gt_boxes_scaled)
-
-        # Use the reverse function to get the box corners in (x1, y1, x2, y2, x3, y3, x4, y4, angle) format
-        x_start = box_cxcywha_to_corners(gt_boxes_corners)
+        x_start = gt_boxes_corners
         x_start = torch.repeat_interleave(x_start, repeat_tensor, dim=0)
-
         # noise sample
         x = self.q_sample(x_start=x_start, t=t, noise=noise)
-
         x = torch.clamp(x, min=-1 * self.scale, max=self.scale)
         x = ((x / self.scale) + 1) / 2.
-
         diff_boxes = box_cxcywha_to_corners(x)
-
         return diff_boxes, noise, t
 
     def prepare_diffusion_concat(self, gt_boxes):
@@ -417,42 +428,135 @@ class DiffusionDet(nn.Module):
     
         return diff_boxes, noise, t
 
+# in case i add an angel diffrential the i have to adjust the following function
+    def model_predictions(self, backbone_feats, images_whwh, x, t, x_self_cond=None, clip_x_start=False):
+    
+        """
+        Make model predictions given the backbone features, bounding box coordinates, and timestep.
+
+        Args:
+            backbone_feats (list[torch.Tensor]): List of backbone feature maps, each with shape (batch_size, C, H, W).
+            images_whwh (torch.Tensor): Tensor of shape (batch_size, 4) representing the original image dimensions (width, height, width, height).
+            x (torch.Tensor): Tensor of shape (batch_size, num_proposals, 8) representing the current bounding box coordinates in corners format (x0, y0, x1, y1, x2, y2, x3, y3).
+            t (torch.Tensor): Tensor of shape (batch_size,) representing the current timestep.
+            x_self_cond (torch.Tensor, optional): Tensor of shape (batch_size, num_proposals, 8) representing the self-conditioning bounding box coordinates. Default is None.
+            clip_x_start (bool, optional): Whether to clip the predicted starting bounding box coordinates. Default is False.
+
+        Returns:
+            tuple: A tuple containing the following elements:
+                - ModelPrediction: A namedtuple containing the predicted noise (pred_noise) and the predicted starting bounding box coordinates (pred_x_start).
+                - outputs_class: A list of predicted class probabilities for each proposal, each with shape (batch_size, num_proposals, num_classes).
+                - outputs_coord: A list of predicted bounding box coordinates for each proposal, each with shape (batch_size, num_proposals, 8).
+        """
+        
+        x_boxes = torch.clamp(x, min=-1 * self.scale, max=self.scale)
+        x_boxes = ((x_boxes / self.scale) + 1) / 2
+        x_boxes = x_boxes * torch.stack([images_whwh[:, 0], images_whwh[:, 1], images_whwh[:, 0], images_whwh[:, 1], images_whwh[:, 0], images_whwh[:, 1], images_whwh[:, 0], images_whwh[:, 1]], dim=-1)[:, None, :]
+    
+        outputs_class, outputs_coord = self.head(backbone_feats, x_boxes, t, None)
+    
+        x_start = outputs_coord[-1]  # (batch_size, num_proposals, 8) predicted boxes in corners format (x0, y0, x1, y1, x2, y2, x3, y3)
+        x_start = x_start / torch.stack([images_whwh[:, 0], images_whwh[:, 1], images_whwh[:, 0], images_whwh[:, 1], images_whwh[:, 0], images_whwh[:, 1], images_whwh[:, 0], images_whwh[:, 1]], dim=-1)[:, None, :]
+        x_start = (x_start * 2 - 1.) * self.scale
+        x_start = torch.clamp(x_start, min=-1 * self.scale, max=self.scale)
+    
+        pred_noise = self.predict_noise_from_start(x, t, x_start)
+    
+        return ModelPrediction(pred_noise, x_start), outputs_class, outputs_coord
+
+    def forward(self, batched_inputs, do_postprocess=True):
+        """
+        Forward pass of the model.
+
+        Args:
+           batched_inputs (list[dict]): A list of input samples, where each sample is a dictionary.
+           do_postprocess (bool, optional): Whether to apply post-processing to the model outputs. Default is True.
+    
+        Returns:
+            dict: A dictionary containing the model's output, which includes the predicted class probabilities, bounding box coordinates, and optional auxiliary outputs and loss values.
+        """
+        images, images_whwh = self.preprocess_image(batched_inputs)
+        if isinstance(images, (list, torch.Tensor)):
+            images = nested_tensor_from_tensor_list(images)
+
+        # Feature Extraction.
+        src = self.backbone(images.tensor)
+        features = list()
+        for f in self.in_features:
+            feature = src[f]
+            features.append(feature)
+
+        # Prepare Proposals.
+        if not self.training:
+            results = self.ddim_sample(batched_inputs, features, images_whwh, images)
+            return results
+
+        if self.training:
+            gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+            targets, x_boxes, noises, t = self.prepare_targets(gt_instances)
+            t = t.squeeze(-1)
+        
+            # Scale the bounding boxes to the original image size
+            x_boxes = x_boxes * torch.stack([images_whwh[:, 0], images_whwh[:, 1], images_whwh[:, 0], images_whwh[:, 1], images_whwh[:, 0], images_whwh[:, 1], images_whwh[:, 0], images_whwh[:, 1]], dim=-1)[:, None, :]
+
+            outputs_class, outputs_coord = self.head(features, x_boxes, t, None)
+            output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+
+            if self.deep_supervision:
+                output['aux_outputs'] = [{'pred_logits': a, 'pred_boxes': b}
+                                        for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+
+            loss_dict = self.criterion(output, targets)
+            weight_dict = self.criterion.weight_dict
+            for k in loss_dict.keys():
+                if k in weight_dict:
+                    loss_dict[k] *= weight_dict[k]
+            return loss_dict
+ 
     def prepare_targets(self, targets):
+        """
+        Prepare the target bounding boxes and associated information for training.
+
+        Args:
+            targets (list[Instances]): A list of target instances, where each instance contains ground truth bounding boxes and class labels.
+
+        Returns:
+            tuple: A tuple containing the following elements:
+                - new_targets (list[dict]): A list of dictionaries, where each dictionary contains the prepared target information for an image.
+                - torch.Tensor: A tensor of shape (batch_size, num_proposals, 8) representing the diffused bounding boxes.
+                - torch.Tensor: A tensor of shape (batch_size, num_proposals, 8) representing the noise used for diffusion.
+                - torch.Tensor: A tensor of shape (batch_size,) representing the timesteps used for diffusion.
+        """
         new_targets = []
         diffused_boxes = []
         noises = []
         ts = []
-
         for targets_per_image in targets:
             target = {}
             h, w = targets_per_image.image_size
-#Note that this normalization assumes that the corner coordinates are provided in a consistent order (e.g., top-left, top-right, bottom-right, bottom-left). Make sure that the corner coordinates in your dataset follow the  expected order for this normalization to work correctly.
             image_size_xyxy = torch.as_tensor([w, h, w, h, w, h, w, h], dtype=torch.float, device=self.device)
-            gt_classes = targets_per_image.gt_classes  # Shape: (num_boxes,)
-            gt_boxes = targets_per_image.gt_boxes.tensor  # Shape: (num_boxes, 8)
-            
-            # Check if gt_boxes has a shape of (num_boxes, 4) and convert it to corner representation
+            gt_classes = targets_per_image.gt_classes
+            gt_boxes = targets_per_image.gt_boxes.tensor
             if gt_boxes.shape[-1] == 4:
-                gt_boxes = box_xyxy_to_corners(gt_boxes)  # Shape: (num_boxes, 8)
-                
-            gt_boxes_normalized = gt_boxes / image_size_xyxy  # Shape: (num_boxes, 8)
-
-            # Call prepare_diffusion_concat function to get diffused boxes and noise
-            d_boxes, d_noise, d_t = self.prepare_diffusion_concat(gt_boxes_normalized)
-
-            diffused_boxes.append(d_boxes)  # Shape: (num_boxes, 8)
-            noises.append(d_noise)  # Shape: (num_boxes, 8)
-            ts.append(d_t)  # Shape: (1,)
-
-            # Update target dictionary
-            target["labels"] = gt_classes.to(self.device)  # Shape: (num_boxes,)
-            target["boxes"] = gt_boxes.to(self.device)  # Shape: (num_boxes, 8)
-            target["boxes_normalized"] = gt_boxes_normalized.to(self.device)  # Shape: (num_boxes, 8)
-            target["image_size_xyxy"] = image_size_xyxy.to(self.device)  # Shape: (8,)
+                # Convert gt_boxes from (x1, y1, x2, y2) to (x0, y0, x1, y1, x2, y2, x3, y3)
+                gt_boxes = box_xyxy_to_corners(gt_boxes)
+            tensor_a_dim = gt_boxes.size()
+            tensor_b_dim = image_size_xyxy.size()
+            
+            #       raise AssertionError(f"Tensor dimensions mismatch: gt_boxes: {tensor_a_dim}, image_size_xyxy: {tensor_b_dim},target")
+            gt_boxes = box_cxcywha_to_corners(gt_boxes)
+            gt_boxes = gt_boxes / image_size_xyxy
+            d_boxes, d_noise, d_t = self.prepare_diffusion_concat(gt_boxes)
+            diffused_boxes.append(d_boxes)
+            noises.append(d_noise)
+            ts.append(d_t)
+            target["labels"] = gt_classes.to(self.device)
+            target["boxes"] = gt_boxes.to(self.device)
+            target["boxes_xyxy"] = targets_per_image.gt_boxes.tensor.to(self.device)
+            target["image_size_xyxy"] = image_size_xyxy.to(self.device)
             image_size_xyxy_tgt = image_size_xyxy.unsqueeze(0).repeat(len(gt_boxes), 1)
-            target["image_size_xyxy_tgt"] = image_size_xyxy_tgt.to(self.device)  # Shape: (num_boxes, 8)
-            target["area"] = targets_per_image.gt_boxes.area().to(self.device)  # Shape: (num_boxes,)
-  
+            target["image_size_xyxy_tgt"] = image_size_xyxy_tgt.to(self.device)
+            target["area"] = targets_per_image.gt_boxes.area().to(self.device)
             new_targets.append(target)
 
         return new_targets, torch.stack(diffused_boxes), torch.stack(noises), torch.stack(ts)
@@ -462,9 +566,9 @@ class DiffusionDet(nn.Module):
         Arguments:
             box_cls (Tensor): tensor of shape (batch_size, num_proposals, K).
                 The tensor predicts the classification probability for each proposal.
-            box_pred (Tensor): tensors of shape (batch_size, num_proposals, 5).
-                The tensor predicts 5-vector (x,y,w,h,angle) box
-                regression values for every proposal
+            box_pred (Tensor): tensors of shape (batch_size, num_proposals, 8).
+                The tensor predicts 8-vector (x0, y0, x1, y1, x2, y2, x3, y3) box
+                regression values for every proposal.
             image_sizes (List[torch.Size]): the input image sizes
 
         Returns:
@@ -472,31 +576,36 @@ class DiffusionDet(nn.Module):
         """
         assert len(box_cls) == len(image_sizes)
         results = []
-
+  
         if self.use_focal or self.use_fed_loss:
             scores = torch.sigmoid(box_cls)
             labels = torch.arange(self.num_classes, device=self.device). \
                 unsqueeze(0).repeat(self.num_proposals, 1).flatten(0, 1)
-
+    
             for i, (scores_per_image, box_pred_per_image, image_size) in enumerate(zip(
                     scores, box_pred, image_sizes
             )):
                 result = Instances(image_size)
                 scores_per_image, topk_indices = scores_per_image.flatten(0, 1).topk(self.num_proposals, sorted=False)
                 labels_per_image = labels[topk_indices]
-                box_pred_per_image = box_pred_per_image.view(-1, 1, 5).repeat(1, self.num_classes, 1).view(-1, 5)
+                box_pred_per_image = box_pred_per_image.view(-1, 1, 8).repeat(1, self.num_classes, 1).view(-1, 8)
                 box_pred_per_image = box_pred_per_image[topk_indices]
 
                 if self.use_ensemble and self.sampling_timesteps > 1:
                     return box_pred_per_image, scores_per_image, labels_per_image
-
+  
                 if self.use_nms:
-                    keep = batched_nms(box_pred_per_image, scores_per_image, labels_per_image, 0.5)
+                    # Convert box_pred_per_image from corners format to (x_ctr, y_ctr, width, height, angle_degrees) format
+                    boxes_for_nms = box_corners_to_cxcywha(box_pred_per_image)
+                    keep = batched_nms_rotated(boxes_for_nms, scores_per_image, labels_per_image, 0.5)
                     box_pred_per_image = box_pred_per_image[keep]
                     scores_per_image = scores_per_image[keep]
                     labels_per_image = labels_per_image[keep]
 
-                result.pred_boxes = Boxes(box_pred_per_image)
+                # Convert box_pred_per_image from corners format to (x_ctr, y_ctr, width, height, angle_degrees) format
+                boxes_cxcywha = box_corners_to_cxcywha(box_pred_per_image)
+
+                result.pred_boxes = RotatedBoxes(boxes_cxcywha)  # Use RotatedBoxes with converted format
                 result.scores = scores_per_image
                 result.pred_classes = labels_per_image
                 results.append(result)
@@ -512,12 +621,18 @@ class DiffusionDet(nn.Module):
                     return box_pred_per_image, scores_per_image, labels_per_image
 
                 if self.use_nms:
-                    keep = batched_nms(box_pred_per_image, scores_per_image, labels_per_image, 0.5)
+                    # Convert box_pred_per_image from corners format to (x_ctr, y_ctr, width, height, angle_degrees) format
+                    boxes_for_nms = box_corners_to_cxcywha(box_pred_per_image)
+                    keep = batched_nms_rotated(boxes_for_nms, scores_per_image, labels_per_image, 0.5)
                     box_pred_per_image = box_pred_per_image[keep]
                     scores_per_image = scores_per_image[keep]
                     labels_per_image = labels_per_image[keep]
+
+                 # Convert box_pred_per_image from corners format to (x_ctr, y_ctr, width, height, angle_degrees) format
+                boxes_cxcywha = box_corners_to_cxcywha(box_pred_per_image)
+
                 result = Instances(image_size)
-                result.pred_boxes = Boxes(box_pred_per_image)
+                result.pred_boxes = RotatedBoxes(boxes_cxcywha)  # Use RotatedBoxes with converted format
                 result.scores = scores_per_image
                 result.pred_classes = labels_per_image
                 results.append(result)
